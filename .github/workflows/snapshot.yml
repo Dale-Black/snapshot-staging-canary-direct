@@ -1,0 +1,302 @@
+name: Snapshot — build & publish
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-export every notebook (ignore all export caches)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+concurrency:
+  group: snapshot-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # Immutable audited inputs for the free-tier test. Upgrade deliberately.
+  SNAPSHOT_WT_REF: cadb908093efee3b08a065f50930d3337916391d # WasmTarget main (2026-07-14)
+  SNAPSHOT_ENGINE_REF: cc7acb0e9c5a8fb8cc7ca3c1f02ae3be326cefc2 # Snapshot.jl main (2026-07-15)
+  SNAPSHOT_EXPORT_SHA256: e92498be5a535d4d9a3cd3811ffe342a2a2d80d7432c57ff6197a12ec91537fa
+  SNAPSHOT_COLLECTION_SHA256: 2f686c994bdb24e4c89a4404e8a48bde23e4917fcb4ab2f8362a35c8f3c7dacc
+  SNAPSHOT_UPLOAD_SHA256: 318bbffce0d18336b1e172963fa7feeb12b648cd1be37a46ca2d6f95213dc4c7
+  BINARYEN_VERSION: version_125
+  WASMTOOLS_VERSION: 1.244.0
+  BINARYEN_SHA256: 7c3bc16599c8274a04d34a504fe4be2047884f900e0e2da2f6fb9cd667183be4
+  WASMTOOLS_SHA256: c3bf279c10e8ca37262773c829efd45423b5efeeb93ba1dc17baf25d9479074c
+  SNAPSHOT_OPTIMIZE: size
+  SNAPSHOT_ORACLE_SAMPLES: "5"
+  SNAPSHOT_INGEST_URL: https://staging.snapshot.show
+
+# Build model (general, one-size-fits-most):
+#   discover → detect app vs collection + list notebooks, and WARM the Julia depot
+#             cache (instantiate + precompile ONCE).
+#   export   → a notebook collection fans out: one job per notebook, each RESTORES
+#             the warmed depot (no re-precompile) and compiles its notebook in
+#             parallel. fail-fast:false so one bad notebook never sinks the rest.
+#   publish  → gather the per-notebook outputs into one site, DEDUPLICATE the shared
+#             WasmMakie font atlas, then zip → attest → ingest (OIDC). Apps skip the
+#             matrix and build/publish in a single job.
+# Fine-tuning is via the repo's snapshot.toml (type/app/home/theme/oracle) and a
+# blessed build.sh for apps — the defaults Just Work without any of that.
+
+jobs:
+  workflow-update:
+    # A managed workflow-only commit should not spend minutes rebuilding the
+    # user's project. This successful sentinel keeps branch checks conclusive;
+    # the new workflow takes effect on the next project push (or manual run).
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[snapshot workflow update]')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Snapshot workflow updated; project build intentionally deferred until the next source push."
+
+  discover:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[snapshot workflow update]')
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.d.outputs.kind }}
+      matrix: ${{ steps.d.outputs.matrix }}
+      has_notebooks: ${{ steps.d.outputs.has_notebooks }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { path: repo }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/WasmTarget.jl, ref: "${{ env.SNAPSHOT_WT_REF }}", path: WasmTarget.jl }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/Snapshot.jl, ref: "${{ env.SNAPSHOT_ENGINE_REF }}", path: Snapshot.jl }
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2
+        with: { version: "1.12" }
+      - uses: julia-actions/cache@d10a6fd8f31b12404a54613ebad242900567f2b9 # v2 — warms shared depot
+      - name: Instantiate + precompile engine (shared by every matrix job)
+        run: julia --project=Snapshot.jl -e 'using Pkg; Pkg.Registry.add("General"); Pkg.instantiate(); using Snapshot'
+      - name: Fetch Snapshot driver + collection builder
+        run: |
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_EXPORT_SHA256}/export.jl" -o export.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_COLLECTION_SHA256}/collection.jl" -o collection.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_UPLOAD_SHA256}/upload.mjs" -o upload.mjs
+          echo "${SNAPSHOT_EXPORT_SHA256}  export.jl" | sha256sum -c -
+          echo "${SNAPSHOT_COLLECTION_SHA256}  collection.jl" | sha256sum -c -
+          echo "${SNAPSHOT_UPLOAD_SHA256}  upload.mjs" | sha256sum -c -
+      - id: d
+        name: Discover (kind + notebook matrix)
+        run: |
+          julia --project=Snapshot.jl export.jl discover repo discover.json
+          kind=$(jq -r '.kind' discover.json)
+          matrix=$(jq -c '{nb: .notebooks}' discover.json)
+          n=$(jq '.notebooks | length' discover.json)
+          { echo "kind=$kind"; echo "matrix=$matrix"; echo "has_notebooks=$([ "${n:-0}" -gt 0 ] && echo true || echo false)"; } >> "$GITHUB_OUTPUT"
+          echo "→ kind=$kind, $n notebook(s)"
+
+  # ── a notebook collection: one parallel job per notebook ──────────────────
+  export:
+    needs: discover
+    if: needs.discover.outputs.kind == 'collection' && needs.discover.outputs.has_notebooks == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { path: repo }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/WasmTarget.jl, ref: "${{ env.SNAPSHOT_WT_REF }}", path: WasmTarget.jl }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/Snapshot.jl, ref: "${{ env.SNAPSHOT_ENGINE_REF }}", path: Snapshot.jl }
+      # ── per-notebook export cache: key = notebook source hash + engine content +
+      # WasmTarget SHA + every knob that changes the compiled output (optimize level,
+      # oracle depth, Binaryen/wasm-tools versions). A cache HIT means NOTHING that
+      # affects this notebook's export changed since it was last built → restore its
+      # <slug>/ and skip Julia entirely. Only CHANGED notebooks pay the compile cost.
+      # OVERRIDES (skip the cache → always re-export):
+      #   • snapshot.toml `cache = false` (top-level: all notebooks; or per-[[notebooks]])
+      #   • manual run with the "force" checkbox (Actions → Run workflow)
+      # (Custom build.sh / app builds never use this cache — they always run in full.)
+      - id: keys
+        name: Compute cache key parts (WasmTarget SHA)
+        run: |
+          echo "wt=$(git -C WasmTarget.jl rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        if: matrix.nb.cache != false && inputs.force != true
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: _stage/${{ matrix.nb.slug }}
+          # v4: + oracle depth + Binaryen/wasm-tools versions (all affect the emitted
+          # wasm/verification). Engine-CONTENT hash (not commit SHA) so an engine
+          # docs-only push doesn't bust every tenant's notebook cache.
+          key: snap-nb-v4-${{ matrix.nb.slug }}-${{ hashFiles(format('repo/{0}', matrix.nb.notebook)) }}-wt${{ steps.keys.outputs.wt }}-eng${{ hashFiles('Snapshot.jl/src/**', 'Snapshot.jl/assets/**', 'Snapshot.jl/Project.toml') }}-${{ env.SNAPSHOT_OPTIMIZE }}-o${{ env.SNAPSHOT_ORACLE_SAMPLES }}-b${{ env.BINARYEN_VERSION }}-t${{ env.WASMTOOLS_VERSION }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2
+        with: { version: "1.12" }
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: julia-actions/cache@d10a6fd8f31b12404a54613ebad242900567f2b9 # v2 — restores warmed depot
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: "22" }
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Install Binaryen (wasm-opt, wasm-merge)
+        run: |
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" -o binaryen.tar.gz
+          echo "${BINARYEN_SHA256}  binaryen.tar.gz" | sha256sum -c -
+          tar -xzf binaryen.tar.gz
+          echo "$PWD/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Install wasm-tools
+        run: |
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASMTOOLS_VERSION}/wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux.tar.gz" -o wasm-tools.tar.gz
+          echo "${WASMTOOLS_SHA256}  wasm-tools.tar.gz" | sha256sum -c -
+          tar -xzf wasm-tools.tar.gz
+          echo "$PWD/wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Instantiate (restored cache → fast)
+        run: julia --project=Snapshot.jl -e 'using Pkg; Pkg.instantiate()'
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Fetch Snapshot driver + collection builder
+        run: |
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_EXPORT_SHA256}/export.jl" -o export.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_COLLECTION_SHA256}/collection.jl" -o collection.jl
+          echo "${SNAPSHOT_EXPORT_SHA256}  export.jl" | sha256sum -c -
+          echo "${SNAPSHOT_COLLECTION_SHA256}  collection.jl" | sha256sum -c -
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Export ${{ matrix.nb.slug }}
+        run: julia --project=Snapshot.jl export.jl one repo _stage "${{ matrix.nb.slug }}" "${{ matrix.nb.notebook }}"
+      - name: Cache status
+        run: |
+          hit="${{ steps.cache.outputs.cache-hit || 'false' }}"
+          why=""
+          [ "${{ matrix.nb.cache }}" = "false" ] && why=" (snapshot.toml cache=false)"
+          [ "${{ inputs.force }}" = "true" ] && why=" (forced re-export)"
+          if [ "$hit" = "true" ]; then
+            echo "♻️  \`${{ matrix.nb.slug }}\` — unchanged, reused cached export" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "🔨 \`${{ matrix.nb.slug }}\` — exported$why" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "${{ matrix.nb.slug }} cache-hit=$hit$why"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nb-${{ matrix.nb.slug }}
+          path: _stage
+          retention-days: 1
+          if-no-files-found: error
+
+  collection-publish:
+    needs: [discover, export]
+    if: needs.discover.outputs.kind == 'collection' && needs.discover.outputs.has_notebooks == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { path: repo }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/WasmTarget.jl, ref: "${{ env.SNAPSHOT_WT_REF }}", path: WasmTarget.jl }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/Snapshot.jl, ref: "${{ env.SNAPSHOT_ENGINE_REF }}", path: Snapshot.jl }
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2
+        with: { version: "1.12" }
+      - uses: julia-actions/cache@d10a6fd8f31b12404a54613ebad242900567f2b9 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: "22" }
+      - name: Instantiate (restored cache → fast)
+        run: julia --project=Snapshot.jl -e 'using Pkg; Pkg.instantiate()'
+      - name: Fetch Snapshot driver + collection builder
+        run: |
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_EXPORT_SHA256}/export.jl" -o export.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_COLLECTION_SHA256}/collection.jl" -o collection.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_UPLOAD_SHA256}/upload.mjs" -o upload.mjs
+          echo "${SNAPSHOT_EXPORT_SHA256}  export.jl" | sha256sum -c -
+          echo "${SNAPSHOT_COLLECTION_SHA256}  collection.jl" | sha256sum -c -
+          echo "${SNAPSHOT_UPLOAD_SHA256}  upload.mjs" | sha256sum -c -
+      - name: Gather per-notebook exports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nb-*
+          merge-multiple: true
+          path: _stage
+      - name: Assemble site (+ dedup shared font atlas) → manifest
+        run: julia --project=Snapshot.jl export.jl gather repo _stage
+      - name: Package the site as one zip
+        run: |
+          ok=$(jq -r '.ok' _stage/manifest.json)
+          [ "${ok:-0}" -gt 0 ] || { echo "no notebooks published"; exit 1; }
+          ( cd _stage && zip -qr "$GITHUB_WORKSPACE/site.zip" . )
+          node upload.mjs _stage upload-manifest.json prepare
+          ls -la site.zip
+      - name: Attest build provenance
+        # GitHub's provenance attestation isn't available for user-owned PRIVATE
+        # repos, so it errors there and would sink the publish. Skip it for private
+        # repos (Snapshot sends its own sha256(site.zip) digest at publish anyway);
+        # continue-on-error keeps a transient public-repo hiccup non-fatal too.
+        if: ${{ github.event.repository.private != true }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            site.zip
+            upload-manifest.json
+      - name: Publish site to Snapshot (OIDC)
+        run: node upload.mjs _stage upload-manifest.json
+
+  # ── a Therapy app: single-job build + publish (snapshot.toml/build.sh drive it) ──
+  app-publish:
+    needs: discover
+    if: needs.discover.outputs.kind == 'app'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { path: repo }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/WasmTarget.jl, ref: "${{ env.SNAPSHOT_WT_REF }}", path: WasmTarget.jl }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { repository: GroupTherapyOrg/Snapshot.jl, ref: "${{ env.SNAPSHOT_ENGINE_REF }}", path: Snapshot.jl }
+      - uses: julia-actions/setup-julia@4c0cb0fce8556fdb04a90347310e5db8b1f98fb9 # v2
+        with: { version: "1.12" }
+      - uses: julia-actions/cache@d10a6fd8f31b12404a54613ebad242900567f2b9 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: { node-version: "22" }
+      - name: Install Binaryen (wasm-opt, wasm-merge)
+        run: |
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" -o binaryen.tar.gz
+          echo "${BINARYEN_SHA256}  binaryen.tar.gz" | sha256sum -c -
+          tar -xzf binaryen.tar.gz
+          echo "$PWD/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+      - name: Install wasm-tools
+        run: |
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASMTOOLS_VERSION}/wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux.tar.gz" -o wasm-tools.tar.gz
+          echo "${WASMTOOLS_SHA256}  wasm-tools.tar.gz" | sha256sum -c -
+          tar -xzf wasm-tools.tar.gz
+          echo "$PWD/wasm-tools-${WASMTOOLS_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+      - name: Instantiate engine
+        run: julia --project=Snapshot.jl -e 'using Pkg; Pkg.instantiate()'
+      - name: Fetch Snapshot driver + collection builder
+        run: |
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_EXPORT_SHA256}/export.jl" -o export.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_COLLECTION_SHA256}/collection.jl" -o collection.jl
+          curl -fsSL "${SNAPSHOT_INGEST_URL%/}/ci/sha256/${SNAPSHOT_UPLOAD_SHA256}/upload.mjs" -o upload.mjs
+          echo "${SNAPSHOT_EXPORT_SHA256}  export.jl" | sha256sum -c -
+          echo "${SNAPSHOT_COLLECTION_SHA256}  collection.jl" | sha256sum -c -
+          echo "${SNAPSHOT_UPLOAD_SHA256}  upload.mjs" | sha256sum -c -
+      - name: Build app (snapshot.toml [app] / build.sh / app.jl build)
+        run: julia --project=Snapshot.jl export.jl repo _stage
+      - name: Package the site as one zip
+        run: |
+          ok=$(jq -r '.ok' _stage/manifest.json)
+          [ "${ok:-0}" -gt 0 ] || { echo "app produced nothing to publish"; exit 1; }
+          ( cd _stage && zip -qr "$GITHUB_WORKSPACE/site.zip" . )
+          node upload.mjs _stage upload-manifest.json prepare
+          ls -la site.zip
+      - name: Attest build provenance
+        # GitHub's provenance attestation isn't available for user-owned PRIVATE
+        # repos, so it errors there and would sink the publish. Skip it for private
+        # repos (Snapshot sends its own sha256(site.zip) digest at publish anyway);
+        # continue-on-error keeps a transient public-repo hiccup non-fatal too.
+        if: ${{ github.event.repository.private != true }}
+        continue-on-error: true
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            site.zip
+            upload-manifest.json
+      - name: Publish site to Snapshot (OIDC)
+        run: node upload.mjs _stage upload-manifest.json
