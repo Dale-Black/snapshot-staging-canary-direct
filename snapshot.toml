@@ -1,0 +1,4 @@
+title = "Snapshot import isolation canary"
+theme = "fun-light"
+home = "import-isolation.jl"
+cache = false
