@@ -1,3 +1,5 @@
+# Managed by Snapshot. Unknown edits are never overwritten automatically.
+# snapshot-workflow-version: staging-e2e-2026-07-15-1
 name: Snapshot — build & publish
 on:
   push:
