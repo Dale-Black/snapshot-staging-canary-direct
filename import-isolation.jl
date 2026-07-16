@@ -44,6 +44,12 @@ end
 # ╔═╡ ae000006-0000-4000-8000-000000000006
 @bind x CanarySlider(10)
 
+# ╔═╡ ae000009-0000-4000-8000-000000000009
+begin
+    TableOfContents() = nothing
+    TableOfContents()
+end
+
 # ╔═╡ ae000007-0000-4000-8000-000000000007
 md"""
 # Import isolation canary
@@ -54,6 +60,27 @@ not prevent Snapshot from compiling the valid `Statistics`-based output below.
 
 # ╔═╡ ae000008-0000-4000-8000-000000000008
 mean((x, x + 2)) + magnitude(x - 3)
+
+# ╔═╡ ae000010-0000-4000-8000-000000000010
+md"""
+## Collection scroll check
+
+This section makes the staging canary exercise Snapshot's embedded table of
+contents as well as import isolation.
+"""
+
+# ╔═╡ ae000011-0000-4000-8000-000000000011
+Base.HTML("<div style=\"height:1200px\" aria-hidden=\"true\"></div>")
+
+# ╔═╡ ae000012-0000-4000-8000-000000000012
+md"""
+# Final staging anchor
+
+The collection header and sidebar must remain fixed when this anchor is opened.
+"""
+
+# ╔═╡ ae000013-0000-4000-8000-000000000013
+Base.HTML("<div style=\"height:900px\" aria-hidden=\"true\"></div>")
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -126,7 +153,12 @@ version = "5.15.0+0"
 # ╠═ae000004-0000-4000-8000-000000000004
 # ╠═ae000005-0000-4000-8000-000000000005
 # ╠═ae000006-0000-4000-8000-000000000006
+# ╠═ae000009-0000-4000-8000-000000000009
 # ╟─ae000007-0000-4000-8000-000000000007
 # ╠═ae000008-0000-4000-8000-000000000008
+# ╟─ae000010-0000-4000-8000-000000000010
+# ╟─ae000011-0000-4000-8000-000000000011
+# ╟─ae000012-0000-4000-8000-000000000012
+# ╟─ae000013-0000-4000-8000-000000000013
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
