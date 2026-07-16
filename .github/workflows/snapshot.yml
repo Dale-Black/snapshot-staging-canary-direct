@@ -1,5 +1,3 @@
-# Managed by Snapshot. Unknown edits are never overwritten automatically.
-# snapshot-workflow-version: snapshot-5ebf817-semantic-v1
 name: Snapshot — build & publish
 on:
   push:
